@@ -37,23 +37,48 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GH_PAT }}
 
-          # Optional: Customize the trigger phrase (default: @claude)
-          # trigger_phrase: "/claude"
+      - name: Merge Claude's PR
+        if: always() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # Poll issue comments for Claude's compare URL (e.g. .../compare/main...claude/issue-4-xxx?quick_pull=1&title=...)
+          COMPARE_URL=""
+          BRANCH=""
+          for i in $(seq 1 24); do
+            COMPARE_URL=$(gh api "repos/$GH_REPO/issues/$ISSUE_NUMBER/comments" \
+              --jq '[.[] | .body] | add // ""' \
+              | grep -o 'compare/[^?)" ]*' \
+              | head -1 || true)
+            if [ -n "$COMPARE_URL" ]; then
+              BRANCH=$(echo "$COMPARE_URL" | sed 's/^compare\///' | sed 's/^[^.]*\.\.\.//')
+              echo "Found branch: $BRANCH"
+              break
+            fi
+            echo "Waiting for Claude's comment... attempt $i/24"
+            sleep 5
+          done
 
-          # Optional: Trigger when specific user is assigned to an issue
-          # assignee_trigger: "claude-bot"
+          if [ -z "$BRANCH" ]; then
+            echo "No Claude branch found in issue comments after 120s — skipping"
+            exit 0
+          fi
 
-          # Optional: Configure Claude's behavior with CLI arguments
-          # claude_args: |
-          #   --model claude-opus-4-1-20250805
-          #   --max-turns 10
-          #   --allowedTools "Bash(npm install),Bash(npm run build),Bash(npm run test:*),Bash(npm run lint:*)"
-          #   --system-prompt "Follow our coding standards. Ensure all new code has tests. Use TypeScript for new files."
+          # Create PR if Claude didn't open one automatically
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+            PR_URL=$(gh pr create \
+              --head "$BRANCH" \
+              --base main \
+              --title "Claude changes for issue #$ISSUE_NUMBER" \
+              --body "Closes #$ISSUE_NUMBER")
+            PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]*$')
+            echo "Created PR #$PR_NUMBER"
+          else
+            echo "Found existing PR #$PR_NUMBER"
+          fi
 
-          # Optional: Advanced settings configuration
-          # settings: |
-          #   {
-          #     "env": {
-          #       "NODE_ENV": "test"
-          #     }
-          #   }
+          echo "Merging PR #$PR_NUMBER"
+          gh pr merge "$PR_NUMBER" --merge --delete-branch
